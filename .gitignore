@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.env
+.env.*
+
+# Project artifacts
+artifacts/*
+!artifacts/.gitkeep
+!artifacts/*/.gitkeep
+outputs/
+.snakemake/
+reports/figures/
+reports/tables/
+wandb/
+.cache/
+.checkpoints/
+
+# Data
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/manifests/*
+!data/manifests/.gitkeep
+hf_cache/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

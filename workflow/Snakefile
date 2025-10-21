@@ -1,0 +1,71 @@
+# Perplexity selector is available but excluded from batch runs to keep experiments light.
+STRATS = ["random", "kcenter", "kmeans", "herding"]
+SUBS = {
+    "p05": 0.05,
+    "p10": 0.10,
+    "p20": 0.20,
+}
+SEED = 42
+
+SUB_KEYS = list(SUBS.keys())
+
+
+rule all:
+    input:
+        expand(
+            "artifacts/{strategy}/{sub}/seed{seed}/metrics.json",
+            strategy=STRATS,
+            sub=SUB_KEYS,
+            seed=[SEED],
+        )
+
+
+rule prepare:
+    output: "data/processed/sst2.parquet"
+    shell:
+        "uv run python -m src.pipeline stage=prepare"
+
+
+rule select:
+    input:  "data/processed/sst2.parquet"
+    output: "data/manifests/{strategy}_{sub}_seed{seed}.csv"
+    params:
+        frac=lambda wc: SUBS[wc.sub],
+    shell:
+        (
+            "uv run python -m src.pipeline "
+            "stage=select "
+            "selection.name={wildcards.strategy} "
+            "subset.frac={params.frac} "
+            "seed={wildcards.seed}"
+        )
+
+
+rule train:
+    input:  "data/manifests/{strategy}_{sub}_seed{seed}.csv"
+    output: directory("artifacts/{strategy}/{sub}/seed{seed}/model")
+    params:
+        frac=lambda wc: SUBS[wc.sub],
+    shell:
+        (
+            "uv run python -m src.pipeline "
+            "stage=train "
+            "selection.name={wildcards.strategy} "
+            "subset.frac={params.frac} "
+            "seed={wildcards.seed}"
+        )
+
+
+rule eval:
+    input:  directory("artifacts/{strategy}/{sub}/seed{seed}/model")
+    output: "artifacts/{strategy}/{sub}/seed{seed}/metrics.json"
+    params:
+        frac=lambda wc: SUBS[wc.sub],
+    shell:
+        (
+            "uv run python -m src.pipeline "
+            "stage=eval "
+            "selection.name={wildcards.strategy} "
+            "subset.frac={params.frac} "
+            "seed={wildcards.seed}"
+        )

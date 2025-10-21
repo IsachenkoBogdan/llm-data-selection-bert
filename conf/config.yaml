@@ -1,0 +1,52 @@
+
+paths:
+  data_dir: ${hydra:runtime.cwd}/data
+  artifacts_dir: ${hydra:runtime.cwd}/artifacts
+
+seed: 42
+
+stage: "prepare"
+
+data:
+  dataset: "sst2"
+  max_length: 128
+
+model:
+  name: "answerdotai/ModernBERT-base"
+
+features:
+  cache_dir: "features"
+  embeddings:
+    batch_size: 512
+    force_recompute: false
+  pppl:
+    model_name: "Qwen/Qwen3-1.7B-Base"
+    batch_size: 4
+    max_length: 256
+    add_start_token: false
+    force_recompute: false
+  quality:
+    force_recompute: false
+
+train:
+  profile: "baseline"  # baseline | lora | ia3 | bitfit (not implemented in stub)
+  epochs: 1            # 1 epoch for smoke; change for real runs
+  batch_size: 16
+  lr: 2e-5
+  weight_decay: 0.01
+  eval_steps: 100
+
+eval:
+  metrics: ["accuracy","f1"]
+
+subset:
+  frac: 0.10
+
+track:
+  wandb_mode: "online"       # online | offline | disabled
+  project: "llm-data-selection-bert"
+  entity: "dsteamswat"
+
+selection:
+  name: "random"             # random | kcenter | kmeans | herding | perplexity | full
+  params: {}
