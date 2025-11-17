@@ -30,7 +30,7 @@ features:
 
 train:
   profile: "baseline"  # baseline | lora | ia3 | bitfit (not implemented in stub)
-  epochs: 1            # 1 epoch for smoke; change for real runs
+  epochs: 3         # 1 epoch for smoke; change for real runs
   batch_size: 16
   lr: 2e-5
   weight_decay: 0.01
