@@ -1,3 +1,8 @@
+# src/selectors/statistical.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -5,171 +10,162 @@ import pandas as pd
 
 from .base import BaseSelector
 from ..features.predictive_stats import (
-    ensure_predictive_entropy,
-    ensure_wordpiece_ratio,
+    compute_predictive_entropy,
+    compute_wordpiece_ratio,
 )
+
+
+# ---------- Predictive entropy selector ----------
+
+@dataclass
+class _EntropyCfg:
+    model_name: str = "textattack/bert-base-uncased-SST-2"
+    batch_size: int = 32
+    keep: str = "middle"      # "high" | "low" | "middle"
+    middle_low_q: float = 0.2
+    middle_high_q: float = 0.8
 
 
 class PredictiveEntropySel(BaseSelector):
     """
-    Селектор по predictive entropy внешнего SST-2 классификатора.
+    Селектор по predictive entropy:
 
-    Идея: берем примеры, где модель максимально не уверена.
+      - keep="high"   → берём самые неопределённые примеры
+      - keep="low"    → берём самые уверенные
+      - keep="middle" → отбрасываем хвосты, берём среднюю сложность
+
+    Энтропия считается поверх маленького SST-2 классификатора (по умолчанию
+    textattack/bert-base-uncased-SST-2), отдельно от ModernBERT.
     """
 
     def __init__(
         self,
-        entropy_model_name: str = "textattack/bert-base-uncased-SST-2",
-        entropy_batch_size: int = 64,
-        entropy_max_length: int = 128,
-        per_class_balance: bool = True,
+        model_name: str = "textattack/bert-base-uncased-SST-2",
+        batch_size: int = 32,
+        keep: str = "middle",
+        middle_low_q: float = 0.2,
+        middle_high_q: float = 0.8,
     ):
-        self.entropy_model_name = entropy_model_name
-        self.entropy_batch_size = int(entropy_batch_size)
-        self.entropy_max_length = int(entropy_max_length)
-        self.per_class_balance = bool(per_class_balance)
-
-        self._scores: Optional[np.ndarray] = None
-        self._labels: Optional[np.ndarray] = None
+        self.cfg = _EntropyCfg(
+            model_name=model_name,
+            batch_size=batch_size,
+            keep=keep,
+            middle_low_q=middle_low_q,
+            middle_high_q=middle_high_q,
+        )
+        self._entropy: Optional[np.ndarray] = None
+        self._seed: int = 0
 
     def fit(self, df: pd.DataFrame, cfg=None):
-        if "text" not in df.columns:
-            raise ValueError("PredictiveEntropySel expects column 'text' in df")
-
-        texts = df["text"].tolist()
-
-        entropy = ensure_predictive_entropy(
-            texts,
-            model_name=self.entropy_model_name,
-            batch_size=self.entropy_batch_size,
-            max_length=self.entropy_max_length,
+        # df должен содержать колонку "text"
+        self._entropy = compute_predictive_entropy(
+            df["text"],
+            model_name=self.cfg.model_name,
+            batch_size=self.cfg.batch_size,
         )
-
-        self._scores = entropy.astype(np.float32)
-        self._labels = df["label"].to_numpy() if "label" in df.columns else None
+        self._seed = int(getattr(cfg, "seed", 0)) if cfg is not None else 0
         return self
 
     def select(self, df: pd.DataFrame, k: int) -> pd.DataFrame:
-        if self._scores is None:
-            raise RuntimeError("Selector must be fit(df) before select(df, k).")
+        if self._entropy is None:
+            raise RuntimeError("PredictiveEntropySel.fit must be called before select()")
 
+        ent = self._entropy
         n = len(df)
         k = min(k, n)
-        scores = self._scores
-        idx_all = np.arange(n)
 
-        # high entropy = more uncertain = более "интересный"
-        if self.per_class_balance and (self._labels is not None):
-            labels = self._labels
-            uniq = np.unique(labels)
-            k_per = k // len(uniq)
-            selected_idx = []
+        if k <= 0:
+            return df.iloc[0:0].copy()
 
-            for y in uniq:
-                mask = labels == y
-                idx_y = idx_all[mask]
-                scores_y = scores[mask]
-                order_y = np.argsort(-scores_y)  # по убыванию энтропии
-                take = min(k_per, len(idx_y))
-                selected_idx.extend(idx_y[order_y[:take]].tolist())
+        if self.cfg.keep == "high":
+            # самые неопределённые
+            idx = np.argsort(-ent)[:k]
 
-            if len(selected_idx) < k:
-                selected_idx_arr = np.asarray(selected_idx, dtype=int)
-                rest = np.setdiff1d(idx_all, selected_idx_arr, assume_unique=True)
-                scores_rest = scores[rest]
-                order_rest = np.argsort(-scores_rest)
-                need = k - len(selected_idx)
-                selected_idx.extend(rest[order_rest[:need]].tolist())
+        elif self.cfg.keep == "low":
+            # самые уверенные
+            idx = np.argsort(ent)[:k]
 
-            selected_idx = np.asarray(selected_idx, dtype=int)
-        else:
-            order = np.argsort(-scores)
-            selected_idx = order[:k]
+        else:  # "middle"
+            lo = np.quantile(ent, self.cfg.middle_low_q)
+            hi = np.quantile(ent, self.cfg.middle_high_q)
+            middle_mask = (ent >= lo) & (ent <= hi)
+            middle_idx = np.where(middle_mask)[0]
 
-        return df.iloc[selected_idx]
+            if len(middle_idx) <= k:
+                idx = middle_idx
+            else:
+                rng = np.random.default_rng(self._seed)
+                idx = rng.choice(middle_idx, size=k, replace=False)
 
+        return df.iloc[idx].copy()
+
+
+# ---------- WordPiece ratio selector ----------
 
 class WordPieceRatioSel(BaseSelector):
     """
-    Селектор по WordPiece ratio для ModernBERT (или другого токенизатора).
+    Селектор по WordPiece ratio:
 
-    Идея: берем примеры с наиболее "ломаной" лексикой (много сабтокенов на слово)
-    или наоборот — с более простой лексикой, в зависимости от order.
+      WordPiece ratio = (# субтокенов) / (# слов) для текста.
+
+      - keep="high"   → тексты с большим количеством субтокенов / более "сложные"
+      - keep="low"    → более простые / короткие
+      - keep="middle" → отбрасываем экстремально короткие/длинные, берём середину
     """
 
     def __init__(
         self,
-        wp_tokenizer_name: str = "answerdotai/modernbert-base",
-        wp_max_length: int = 128,
-        order: str = "high",          # "high" → самые большие ratio, "low" → самые маленькие
-        per_class_balance: bool = True,
+        model_name: str = "answerdotai/ModernBERT-base",
+        max_length: int = 128,
+        keep: str = "middle",
+        middle_low_q: float = 0.2,
+        middle_high_q: float = 0.8,
     ):
-        self.wp_tokenizer_name = wp_tokenizer_name
-        self.wp_max_length = int(wp_max_length)
-        self.order = order
-        self.per_class_balance = bool(per_class_balance)
+        self.model_name = model_name
+        self.max_length = max_length
+        self.keep = keep
+        self.middle_low_q = middle_low_q
+        self.middle_high_q = middle_high_q
 
-        self._scores: Optional[np.ndarray] = None
-        self._labels: Optional[np.ndarray] = None
+        self._ratio: Optional[np.ndarray] = None
+        self._seed: int = 0
 
     def fit(self, df: pd.DataFrame, cfg=None):
-        if "text" not in df.columns:
-            raise ValueError("WordPieceRatioSel expects column 'text' in df")
-
-        texts = df["text"].tolist()
-
-        wp_ratio = ensure_wordpiece_ratio(
-            texts,
-            tokenizer_name=self.wp_tokenizer_name,
-            max_length=self.wp_max_length,
+        self._ratio = compute_wordpiece_ratio(
+            df["text"],
+            model_name=self.model_name,
+            max_length=self.max_length,
         )
-
-        self._scores = wp_ratio.astype(np.float32)
-        self._labels = df["label"].to_numpy() if "label" in df.columns else None
+        self._seed = int(getattr(cfg, "seed", 0)) if cfg is not None else 0
         return self
 
     def select(self, df: pd.DataFrame, k: int) -> pd.DataFrame:
-        if self._scores is None:
-            raise RuntimeError("Selector must be fit(df) before select(df, k).")
+        if self._ratio is None:
+            raise RuntimeError("WordPieceRatioSel.fit must be called before select()")
 
+        ratio = self._ratio
         n = len(df)
         k = min(k, n)
-        scores = self._scores
-        idx_all = np.arange(n)
 
-        # выбираем направление сортировки
-        if self.order == "high":
-            sort_scores = -scores  # большие ratio → интереснее
-        elif self.order == "low":
-            sort_scores = scores   # маленькие ratio → интереснее
-        else:
-            raise ValueError(f"Unknown order='{self.order}', use 'high' or 'low'.")
+        if k <= 0:
+            return df.iloc[0:0].copy()
 
-        if self.per_class_balance and (self._labels is not None):
-            labels = self._labels
-            uniq = np.unique(labels)
-            k_per = k // len(uniq)
-            selected_idx = []
+        if self.keep == "high":
+            idx = np.argsort(-ratio)[:k]
 
-            for y in uniq:
-                mask = labels == y
-                idx_y = idx_all[mask]
-                sort_y = sort_scores[mask]
-                order_y = np.argsort(sort_y)  # учитываем выбранное направление
-                take = min(k_per, len(idx_y))
-                selected_idx.extend(idx_y[order_y[:take]].tolist())
+        elif self.keep == "low":
+            idx = np.argsort(ratio)[:k]
 
-            if len(selected_idx) < k:
-                selected_idx_arr = np.asarray(selected_idx, dtype=int)
-                rest = np.setdiff1d(idx_all, selected_idx_arr, assume_unique=True)
-                sort_rest = sort_scores[rest]
-                order_rest = np.argsort(sort_rest)
-                need = k - len(selected_idx)
-                selected_idx.extend(rest[order_rest[:need]].tolist())
+        else:  # "middle"
+            lo = np.quantile(ratio, self.middle_low_q)
+            hi = np.quantile(ratio, self.middle_high_q)
+            middle_mask = (ratio >= lo) & (ratio <= hi)
+            middle_idx = np.where(middle_mask)[0]
 
-            selected_idx = np.asarray(selected_idx, dtype=int)
-        else:
-            order = np.argsort(sort_scores)
-            selected_idx = order[:k]
+            if len(middle_idx) <= k:
+                idx = middle_idx
+            else:
+                rng = np.random.default_rng(self._seed)
+                idx = rng.choice(middle_idx, size=k, replace=False)
 
-        return df.iloc[selected_idx]
+        return df.iloc[idx].copy()
