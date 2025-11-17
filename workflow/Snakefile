@@ -1,5 +1,5 @@
 # Perplexity selector is available but excluded from batch runs to keep experiments light.
-STRATS = ["random", "kcenter", "kmeans", "herding"]
+STRATS = ["random", "kcenter", "kmeans", "herding", "entropy_wp"]
 SUBS = {
     "p05": 0.05,
     "p10": 0.10,
