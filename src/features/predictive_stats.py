@@ -1,124 +1,134 @@
-from typing import Sequence, Literal, Optional
+# src/features/predictive_stats.py
+
+from __future__ import annotations
+
+from typing import Optional
 
 import numpy as np
+import pandas as pd
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-
-from .cache import memory  # joblib.Memory как в других фичах
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
-def _load_entropy_model(
-    model_name: str,
+# Модель для predictive entropy (готовая SST-2)
+DEFAULT_ENTROPY_MODEL = "textattack/bert-base-uncased-SST-2"
+# Модель для WordPiece ratio — используем ModernBERT из конфига, но есть дефолт
+DEFAULT_WP_MODEL = "answerdotai/ModernBERT-base"
+
+
+# --- Вспомогательная обвязка для модели энтропии --- #
+
+_entropy_tokenizer = None
+_entropy_model = None
+_entropy_device = None
+
+
+def _get_entropy_model(
+    model_name: str = DEFAULT_ENTROPY_MODEL,
     device: Optional[str] = None,
 ):
+    """
+    Лениво загружаем маленький SST-2-классификатор для оценки энтропии.
+    Никаких градиентов, только inference.
+    """
+    global _entropy_tokenizer, _entropy_model, _entropy_device
+
+    if _entropy_tokenizer is not None and _entropy_model is not None:
+        return _entropy_tokenizer, _entropy_model, _entropy_device
+
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model = AutoModelForSequenceClassification.from_pretrained(model_name)
-    model.to(device)
     model.eval()
+    model.to(device)
+
+    _entropy_tokenizer = tokenizer
+    _entropy_model = model
+    _entropy_device = device
+
     return tokenizer, model, device
 
 
-@memory.cache
-def ensure_predictive_entropy(
-    texts: Sequence[str],
-    model_name: str = "textattack/bert-base-uncased-SST-2",
-    batch_size: int = 64,
+def compute_predictive_entropy(
+    texts: pd.Series,
+    model_name: str = DEFAULT_ENTROPY_MODEL,
+    batch_size: int = 32,
+    device: Optional[str] = None,
+) -> np.ndarray:
+    """
+    Считает predictive entropy для каждого текста:
+      H(p) = -sum_j p_j log p_j, где p = softmax(logits).
+
+    Возвращает np.ndarray shape (N,).
+    """
+    tokenizer, model, device = _get_entropy_model(model_name=model_name, device=device)
+
+    entropies = []
+
+    # гарантируем последовательность строк
+    series = texts.astype(str).reset_index(drop=True)
+
+    for start in range(0, len(series), batch_size):
+        batch_texts = list(series.iloc[start : start + batch_size])
+
+        enc = tokenizer(
+            batch_texts,
+            truncation=True,
+            padding=True,
+            max_length=128,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+
+        with torch.no_grad():
+            logits = model(**enc).logits
+            probs = torch.softmax(logits, dim=-1)
+            log_probs = torch.log(probs + 1e-12)
+            entropy = -(probs * log_probs).sum(dim=-1)
+
+        entropies.append(entropy.cpu().numpy())
+
+    if not entropies:
+        return np.zeros(shape=(0,), dtype=np.float32)
+
+    return np.concatenate(entropies, axis=0).astype(np.float32)
+
+
+# --- WordPiece ratio --- #
+
+def compute_wordpiece_ratio(
+    texts: pd.Series,
+    model_name: str = DEFAULT_WP_MODEL,
     max_length: int = 128,
 ) -> np.ndarray:
     """
-    Predictive entropy для каждого текста.
+    WordPiece ratio = (# субтокенов) / (# слов) для каждого текста.
 
-    H(p) = -∑ p_k log p_k
-    Чем выше энтропия → тем менее уверена модель.
+    Высокое значение → больше редких / сложных слов и субтокенов.
     """
-    tokenizer, model, device = _load_entropy_model(model_name)
-
-    all_ent = []
-    with torch.no_grad():
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            enc = tokenizer(
-                list(batch),
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
-            ).to(device)
-
-            logits = model(**enc).logits  # (B, C)
-            probs = torch.softmax(logits, dim=-1)  # (B, C)
-            ent = -(probs * torch.log(probs + 1e-12)).sum(dim=-1)  # (B,)
-            all_ent.append(ent.cpu().numpy())
-
-    return np.concatenate(all_ent, axis=0)
-
-
-@memory.cache
-def ensure_wordpiece_ratio(
-    texts: Sequence[str],
-    tokenizer_name: str = "answerdotai/modernbert-base",
-    max_length: int = 128,
-) -> np.ndarray:
-    """
-    WordPiece ratio = (# сабтокенов) / (# слов).
-    Высокое значение → редкая / морфологически сложная лексика.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
     ratios = []
-    for t in texts:
-        # сабтокены без [CLS]/[SEP]
-        enc = tokenizer(
-            t,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=max_length,
-        )
-        n_wp = len(enc["input_ids"])
-        n_words = len(t.split())
+    series = texts.astype(str).reset_index(drop=True)
+
+    for t in series:
+        words = t.split()
+        n_words = len(words)
         if n_words == 0:
             ratios.append(0.0)
-        else:
-            ratios.append(n_wp / float(n_words))
+            continue
+
+        encoded = tokenizer(
+            t,
+            truncation=True,
+            padding=False,
+            max_length=max_length,
+            add_special_tokens=True,
+        )
+        n_subtokens = len(encoded["input_ids"])
+
+        ratios.append(float(n_subtokens) / float(n_words))
 
     return np.asarray(ratios, dtype=np.float32)
-
-
-def combine_entropy_wordpiece(
-    entropy: np.ndarray,
-    wp_ratio: np.ndarray,
-    mode: Literal["product", "sum", "entropy_div_wp"] = "product",
-) -> np.ndarray:
-    """
-    Комбинируем predictive entropy и WordPiece ratio в один скор.
-
-    - "product": нормируем обе фичи в [0,1] и берём произведение
-    - "sum": сумма нормированных
-    - "entropy_div_wp": энтропия / (wp_ratio), если хочешь штрафовать за "ломаность"
-    """
-    ent = entropy.astype(np.float32)
-    wpr = wp_ratio.astype(np.float32)
-
-    def _norm(x: np.ndarray) -> np.ndarray:
-        xmin = float(x.min())
-        xmax = float(x.max())
-        if xmax <= xmin + 1e-12:
-            return np.zeros_like(x)
-        return (x - xmin) / (xmax - xmin)
-
-    ent_n = _norm(ent)
-    wpr_n = _norm(wpr)
-
-    if mode == "product":
-        score = ent_n * wpr_n
-    elif mode == "sum":
-        score = ent_n + wpr_n
-    elif mode == "entropy_div_wp":
-        score = ent_n / (wpr_n + 1e-3)
-    else:
-        raise ValueError(f"Unknown combine mode: {mode}")
-
-    return score
