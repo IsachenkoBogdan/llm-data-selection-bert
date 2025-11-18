@@ -3,6 +3,7 @@ from .diversity import KCenterSel, KMeansSel, HerdingSel
 from .statistical import PredictiveEntropySel, WordPieceRatioSel
 from .llm_quality import LLMQualitySel
 from .datadiet import DataDietSel
+from .hybrid import HybridQDISel
 
 REGISTRY = {
     "random": RandomSel,
@@ -14,4 +15,5 @@ REGISTRY = {
     "wordpiece_ratio": WordPieceRatioSel,
     "llm_quality": LLMQualitySel,
     "datadiet": DataDietSel,
+    "hybrid_qdi": HybridQDISel,
 }
