@@ -1,9 +1,8 @@
-from .base import FullSel, RandomSel
-from .diversity import HerdingSel, KCenterSel, KMeansSel
-from .quality import PerplexitySel
+from .base import RandomSel, FullSel
+from .diversity import KCenterSel, KMeansSel, HerdingSel
 from .statistical import PredictiveEntropySel, WordPieceRatioSel
 from .llm_quality import LLMQualitySel
-
+from .datadiet import DataDietSel
 
 REGISTRY = {
     "random": RandomSel,
@@ -11,8 +10,8 @@ REGISTRY = {
     "kcenter": KCenterSel,
     "kmeans": KMeansSel,
     "herding": HerdingSel,
-    "perplexity": PerplexitySel,
-	"entropy": PredictiveEntropySel,
-    "wp_ratio": WordPieceRatioSel,
+    "predictive_entropy": PredictiveEntropySel,
+    "wordpiece_ratio": WordPieceRatioSel,
     "llm_quality": LLMQualitySel,
+    "datadiet": DataDietSel,
 }
