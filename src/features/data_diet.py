@@ -1,159 +1,173 @@
+# src/features/data_diet.py
+
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-from datasets import Dataset
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 
-def _get_dd_cfg(cfg) -> Dict[str, Any]:
-    """Аккуратно вытащить параметры из cfg с дефолтами."""
-    dd = getattr(cfg, "datadiet", None)
-    train = getattr(cfg, "train", None)
-
-    def g(section, name, default):
-        if section is None:
-            return default
-        try:
-            return getattr(section, name)
-        except Exception:
-            return section.get(name, default) if isinstance(section, dict) else default
-
-    return {
-        "epochs": int(g(dd, "epochs", 1)),
-        "batch_size": int(g(dd, "batch_size", 32)),
-        "lr": float(g(dd, "lr", 2e-5 if train is None else g(train, "lr", 2e-5))),
-    }
-
-
-def ensure_el2n_scores(df: pd.DataFrame, cfg=None) -> pd.DataFrame:
+def _infer_text_column(df: pd.DataFrame) -> str:
     """
-    Считает (или грузит из кэша) EL2N score для каждого примера train SST-2.
-
-    EL2N(x) = || p_theta(y | x) - one_hot(y) ||_2, усреднённый по нескольким проходам обучения.
-
-    Возвращает DataFrame с колонками:
-      - idx  : индекс примера в df
-      - el2n : float score (чем выше, тем "важнее"/труднее пример)
+    Определяем, где лежит текст: в 'text' или в 'sentence'.
+    Бросаем внятную ошибку, если ничего не нашли.
     """
-    if cfg is not None and hasattr(cfg, "paths"):
-        artifacts_dir = Path(cfg.paths.artifacts_dir)
-    else:
-        artifacts_dir = Path("artifacts")
+    if "text" in df.columns:
+        return "text"
+    if "sentence" in df.columns:
+        return "sentence"
+    raise ValueError(
+        f"ensure_el2n_scores: expected df to have 'text' or 'sentence' column, got: {list(df.columns)}"
+    )
 
-    feat_dir = artifacts_dir / "features"
-    feat_dir.mkdir(parents=True, exist_ok=True)
-    scores_path = feat_dir / "sst2_el2n_scores.parquet"
 
-    # если уже посчитано — просто читаем и возвращаем
-    if scores_path.exists():
-        scores_df = pd.read_parquet(scores_path)
-        # sanity-check: если размер совпадает, просто возвращаем
-        if len(scores_df) == len(df):
-            return scores_df
+class _EL2NDataset(Dataset):
+    """
+    Простой Dataset, который хранит (idx, sentence, label) и отдаёт их по одному.
+    """
 
-    # иначе считаем с нуля
-    dd_cfg = _get_dd_cfg(cfg) if cfg is not None else {"epochs": 1, "batch_size": 32, "lr": 2e-5}
-    epochs = dd_cfg["epochs"]
-    batch_size = dd_cfg["batch_size"]
-    lr = dd_cfg["lr"]
+    def __init__(self, df_with_idx: pd.DataFrame):
+        # ожидаем колонки: idx, sentence, label
+        self._sentences = df_with_idx["sentence"].astype(str).tolist()
+        self._labels = df_with_idx["label"].astype(int).tolist()
+        self._idx = df_with_idx["idx"].astype(int).tolist()
 
-    model_name = getattr(cfg.model, "name", "answerdotai/ModernBERT-base") if cfg is not None else "answerdotai/ModernBERT-base"
-    max_length = getattr(cfg.data, "max_length", 128) if cfg is not None and hasattr(cfg, "data") else 128
+    def __len__(self) -> int:
+        return len(self._sentences)
+
+    def __getitem__(self, i: int) -> dict[str, Any]:
+        return {
+            "idx": self._idx[i],
+            "sentence": self._sentences[i],
+            "label": self._labels[i],
+        }
+
+
+def ensure_el2n_scores(df: pd.DataFrame, cfg) -> pd.DataFrame:
+    """
+    Упрощённая реализация Data Diet / EL2N:
+
+    - Берём модель cfg.model.name (ModernBERT),
+    - Делаем ОДИН проход по датасету без обучения,
+    - Для каждого примера считаем:
+        * p = softmax(logits)
+        * y_onehot = one_hot(label)
+        * el2n = ||p - y_onehot||_2
+        * ce_loss = cross-entropy(logits, label)
+    - Возвращаем DataFrame с колонками: idx, el2n, ce_loss
+
+    Важно:
+    - idx == исходный индекс df (после reset_index), чтобы селектор мог
+      выровнять по df.index.
+    """
+
+    if "label" not in df.columns:
+        raise ValueError("ensure_el2n_scores: expected 'label' column in df")
+
+    text_col = _infer_text_column(df)
+
+    # добавляем явный idx и переименовываем текст → 'sentence'
+    df_with_idx = (
+        df.reset_index(drop=False)
+        .rename(columns={"index": "idx", text_col: "sentence"})
+        [["idx", "sentence", "label"]]
+        .copy()
+    )
+
+    # ---- конфиги / гиперпараметры из cfg ----
+    model_name = getattr(getattr(cfg, "model", None), "name", None) or "answerdotai/ModernBERT-base"
+    max_length = getattr(getattr(cfg, "data", None), "max_length", 128)
+    batch_size = getattr(getattr(cfg, "train", None), "batch_size", 32)
+    seed = int(getattr(cfg, "seed", 42))
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # ---- токенизатор и модель ----
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    # ---- Dataset / DataLoader ----
+    dataset = _EL2NDataset(df_with_idx)
 
-    # HuggingFace Dataset с индексом
-    df_with_idx = df.reset_index(drop=False).rename(columns={"index": "idx"})
-    hf_ds = Dataset.from_pandas(df_with_idx[["idx", "sentence", "label"]], preserve_index=False)
+    def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
+        sentences = [b["sentence"] for b in batch]
+        labels = torch.tensor([b["label"] for b in batch], dtype=torch.long)
+        idx = torch.tensor([b["idx"] for b in batch], dtype=torch.long)
 
-    def encode(batch):
         enc = tokenizer(
-            batch["sentence"],
+            sentences,
             truncation=True,
             padding="max_length",
             max_length=max_length,
+            return_tensors="pt",
         )
-        enc["labels"] = batch["label"]
-        enc["idx"] = batch["idx"]
+        enc["labels"] = labels
+        enc["idx"] = idx
         return enc
 
-    hf_ds = hf_ds.map(encode, batched=True)
-
-    # PyTorch DataLoader
-    columns = ["input_ids", "attention_mask", "labels", "idx"]
-
-    def collate_fn(batch_list):
-        collated = {col: [] for col in columns}
-        for b in batch_list:
-            for col in columns:
-                collated[col].append(b[col])
-        for col in ["input_ids", "attention_mask"]:
-            collated[col] = torch.tensor(collated[col], dtype=torch.long)
-        collated["labels"] = torch.tensor(collated["labels"], dtype=torch.long)
-        collated["idx"] = torch.tensor(collated["idx"], dtype=torch.long)
-        return collated
-
-    loader = torch.utils.data.DataLoader(
-        hf_ds,
+    loader = DataLoader(
+        dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         collate_fn=collate_fn,
     )
 
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
-    model.to(device)
-    model.train()
+    # ---- проходим по датасету и считаем EL2N ----
+    all_idx: list[int] = []
+    all_el2n: list[float] = []
+    all_ce: list[float] = []
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-
-    n = len(df)
-    # суммарные EL2N и количество появлений каждого примера
-    el2n_sum = torch.zeros(n, dtype=torch.float32)
-    counts = torch.zeros(n, dtype=torch.int32)
-
-    for epoch in range(epochs):
+    with torch.no_grad():
         for batch in loader:
-            idx = batch["idx"].to(device)
+            idx = batch["idx"].cpu().numpy()
             labels = batch["labels"].to(device)
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
 
-            optimizer.zero_grad()
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
+            # убираем служебные поля из batch перед подачей в модель
+            model_inputs = {
+                k: v.to(device)
+                for k, v in batch.items()
+                if k not in ("labels", "idx")
+            }
+
+            outputs = model(**model_inputs)
             logits = outputs.logits
-            loss.backward()
-            optimizer.step()
+            probs = F.softmax(logits, dim=-1)
 
-            with torch.no_grad():
-                probs = torch.softmax(logits, dim=-1)  # (B, num_labels)
-                one_hot = torch.nn.functional.one_hot(labels, num_classes=probs.size(-1)).float()
-                diff = probs - one_hot
-                el2n_batch = torch.linalg.vector_norm(diff, ord=2, dim=-1)  # (B,)
+            # one-hot метки
+            num_classes = probs.shape[-1]
+            one_hot = F.one_hot(labels, num_classes=num_classes).float()
 
-            idx_cpu = idx.detach().cpu()
-            el2n_cpu = el2n_batch.detach().cpu()
+            # EL2N = ||p - y||_2
+            diff = probs - one_hot
+            el2n_batch = torch.sqrt(torch.sum(diff * diff, dim=-1))
 
-            el2n_sum[idx_cpu] += el2n_cpu
-            counts[idx_cpu] += 1
+            # CE loss (per-example)
+            ce_batch = F.cross_entropy(logits, labels, reduction="none")
 
-    # усредняем
-    counts = counts.clamp(min=1)
-    el2n_mean = el2n_sum / counts.to(dtype=torch.float32)
+            all_idx.extend(idx.tolist())
+            all_el2n.extend(el2n_batch.cpu().numpy().tolist())
+            all_ce.extend(ce_batch.cpu().numpy().tolist())
 
+    # ---- собираем DataFrame ----
     scores_df = pd.DataFrame(
         {
-            "idx": np.arange(n, dtype=np.int64),
-            "el2n": el2n_mean.numpy().astype("float32"),
+            "idx": all_idx,
+            "el2n": all_el2n,
+            "ce_loss": all_ce,
         }
     )
-    scores_df.to_parquet(scores_path, index=False)
+
+    # на всякий случай сортируем по idx
+    scores_df = scores_df.sort_values("idx").reset_index(drop=True)
 
     return scores_df
