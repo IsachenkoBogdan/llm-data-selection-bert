@@ -162,9 +162,13 @@ class HybridQDISel(BaseSelector):
         self._labels = df["label"].to_numpy()
 
         # ==== 2) Перплексия (Qwen) ====
-        # ensure_pppl ожидает сначала cfg, потом df
-        pppl_df = ensure_pppl(cfg, df)
-        # выравниваем по индексам текущего df
+        # ensure_pppl ожидает (cfg, df), но возвращает tuple или DF
+        pppl_out = ensure_pppl(cfg, df)
+        if isinstance(pppl_out, tuple):
+            pppl_df = pppl_out[0]
+        else:
+            pppl_df = pppl_out
+
         pppl_df = pppl_df.set_index("idx").loc[df.index]
         pppl = pppl_df["pppl"].to_numpy().astype("float32")
 
@@ -173,8 +177,12 @@ class HybridQDISel(BaseSelector):
         q_pppl = 1.0 - _minmax(log_pppl)
 
         # ==== 3) Текстовые метрики (readability) ====
-        # ensure_quality_indicators также (cfg, df)
-        qual_df = ensure_quality_indicators(cfg, df)
+        qual_out = ensure_quality_indicators(cfg, df)
+        if isinstance(qual_out, tuple):
+            qual_df = qual_out[0]
+        else:
+            qual_df = qual_out
+
         qual_df = qual_df.set_index("idx").loc[df.index]
         if "flesch_reading_ease" in qual_df.columns:
             fre = qual_df["flesch_reading_ease"].to_numpy(dtype=np.float32)
@@ -187,7 +195,7 @@ class HybridQDISel(BaseSelector):
 
         # ==== 4) Importance ====
         if HAS_PRED_ENTROPY:
-            # наша ensure_predictive_entropy мы писали как (df, cfg)
+            # нашу ensure_predictive_entropy мы писали как (df, cfg) и она возвращает DF
             ent_df = ensure_predictive_entropy(df, cfg)
             ent_df = ent_df.set_index("idx").loc[df.index]
             entropy_cols = [c for c in ent_df.columns if c not in ("idx",)]
