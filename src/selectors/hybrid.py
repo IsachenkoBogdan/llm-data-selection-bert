@@ -162,15 +162,19 @@ class HybridQDISel(BaseSelector):
         self._labels = df["label"].to_numpy()
 
         # ==== 2) Перплексия (Qwen) ====
-        pppl_df = ensure_pppl(df, cfg)
+        # ВАЖНО: ensure_pppl ожидает cfg, а не df
+        pppl_df = ensure_pppl(cfg)
+        # выравниваем по индексам текущего df
         pppl_df = pppl_df.set_index("idx").loc[df.index]
         pppl = pppl_df["pppl"].to_numpy().astype("float32")
 
         log_pppl = np.log1p(pppl)
-        q_pppl = 1.0 - _minmax(log_pppl)  # меньше лог-перплексии → лучше качество
+        # меньше лог-перплексии → лучше качество
+        q_pppl = 1.0 - _minmax(log_pppl)
 
         # ==== 3) Текстовые метрики (readability) ====
-        qual_df = ensure_quality_indicators(df, cfg)
+        # Аналогично, ensure_quality_indicators ожидает cfg
+        qual_df = ensure_quality_indicators(cfg)
         qual_df = qual_df.set_index("idx").loc[df.index]
         if "flesch_reading_ease" in qual_df.columns:
             fre = qual_df["flesch_reading_ease"].to_numpy(dtype=np.float32)
@@ -289,7 +293,7 @@ class HybridQDISel(BaseSelector):
         # целевое количество по классам (по распределению на кандидатов)
         target_counts = _compute_target_counts(labels_c, k)
 
-        chosen_indices = []
+        chosen_indices: List[int] = []
 
         # сначала набираем по классам, сортируя по qdi_score
         for cls, target_k in target_counts.items():
