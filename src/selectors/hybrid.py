@@ -1,23 +1,29 @@
+# src/selectors/hybrid.py
+
+from __future__ import annotations
+
+from typing import Dict, Any, List
+
 import numpy as np
 import pandas as pd
-from typing import Dict
+from sklearn.cluster import KMeans
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel
 
 from .base import BaseSelector
 from ..features import (
-    ensure_modernbert_cls,
     ensure_pppl,
     ensure_quality_indicators,
 )
 
+# опциональная важность из предиктивной энтропии
 try:
-    # опционально: если есть модуль с предиктивной энтропией – используем
     from ..features.predictive_stats import ensure_predictive_entropy
 
     HAS_PRED_ENTROPY = True
 except Exception:
     HAS_PRED_ENTROPY = False
-
-from sklearn.cluster import KMeans
 
 
 def _minmax(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -36,7 +42,7 @@ def _compute_target_counts(labels: np.ndarray, k: int) -> Dict[int, int]:
 
     raw = fracs * k
     base = np.floor(raw).astype(int)
-    missing = k - base.sum()
+    missing = k - int(base.sum())
 
     fractional = raw - base
     order = np.argsort(-fractional)
@@ -47,23 +53,84 @@ def _compute_target_counts(labels: np.ndarray, k: int) -> Dict[int, int]:
     return {int(c): int(n) for c, n in zip(uniq, base)}
 
 
+class _CLSDataset(Dataset):
+    """Простой датасет для получения CLS-эмбеддингов."""
+
+    def __init__(self, texts: List[str]):
+        self.texts = list(map(str, texts))
+
+    def __len__(self) -> int:
+        return len(self.texts)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        return {"text": self.texts[idx]}
+
+
+def _compute_cls_embeddings(df: pd.DataFrame, cfg) -> np.ndarray:
+    """
+    Считаем CLS-эмбеддинги ModernBERT без использования ensure_modernbert_cls.
+    Возвращает массив shape (N, D), где N = len(df).
+    """
+    # определяем колонку с текстом
+    if "text" in df.columns:
+        text_col = "text"
+    elif "sentence" in df.columns:
+        text_col = "sentence"
+    else:
+        raise ValueError(
+            f"_compute_cls_embeddings: expected 'text' or 'sentence' column, got {list(df.columns)}"
+        )
+
+    model_name = getattr(getattr(cfg, "model", None), "name", "answerdotai/ModernBERT-base")
+    max_length = getattr(getattr(cfg, "data", None), "max_length", 128)
+
+    # batch_size: пробуем взять из cfg.features.embeddings.batch_size, иначе дефолт
+    bs = 512
+    try:
+        bs = int(cfg.features.embeddings.batch_size)
+    except Exception:
+        pass
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    model = AutoModel.from_pretrained(model_name)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    dataset = _CLSDataset(df[text_col].tolist())
+    loader = DataLoader(dataset, batch_size=bs, shuffle=False)
+
+    all_embs: List[np.ndarray] = []
+
+    with torch.no_grad():
+        for batch in loader:
+            enc = tokenizer(
+                batch["text"],
+                truncation=True,
+                padding="max_length",
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
+            outputs = model(**enc)
+            # CLS: первый токен
+            hidden = outputs.last_hidden_state  # (B, L, D)
+            cls = hidden[:, 0, :]               # (B, D)
+            all_embs.append(cls.cpu().numpy())
+
+    X = np.concatenate(all_embs, axis=0)
+    assert X.shape[0] == len(df), "Mismatch between embeddings and df length"
+    return X.astype("float32")
+
+
 class HybridQDISel(BaseSelector):
     """
     Гибридный селектор Quality–Diversity–Importance.
 
-    Идея:
-      - Quality: перплексия Qwen + readability (Flesch).
-      - Diversity: размер кластера ModernBERT-эмбеддингов (KMeans) –
-                   редкие кластеры считаются более разнообразными.
-      - Importance: предиктивная энтропия ModernBERT (если доступна),
-                    иначе "средняя" перплексия как proxy сложности.
-
-    Алгоритм:
-      1) считаем Q, D, I для каждого примера;
-      2) склеиваем в qdi_score = α_q*Q + α_i*I + α_d*D;
-      3) выбрасываем нижний quantile по качеству (quality_quantile_cut);
-      4) из оставшихся выбираем top-k по qdi_score так, чтобы
-         сохранить распределение классов как в исходном train.
+    • Quality: перплексия Qwen + readability (Flesch).
+    • Diversity: редкость кластера ModernBERT CLS (KMeans).
+    • Importance: предиктивная энтропия ModernBERT (если есть),
+                  иначе "средняя сложность" по перплексии.
     """
 
     def __init__(
@@ -86,23 +153,23 @@ class HybridQDISel(BaseSelector):
         if "label" not in df.columns:
             raise ValueError("HybridQDISel expects a 'label' column in df.")
 
-        # ===== 1) Эмбеддинги ModernBERT =====
-        emb_df = ensure_modernbert_cls(df, cfg)
-        # ожидаем формат с колонкой "idx" и колонкой "emb" (np.ndarray)
-        emb_df = emb_df.set_index("idx").loc[df.index]
-        X = np.stack(emb_df["emb"].to_numpy()).astype("float32")
+        if cfg is None:
+            raise ValueError("HybridQDISel.fit requires cfg (Hydra config).")
+
+        # ==== 1) CLS-эмбеддинги ModernBERT ====
+        X = _compute_cls_embeddings(df, cfg)
         self._X = X
         self._labels = df["label"].to_numpy()
 
-        # ===== 2) Перплексия (Qwen) =====
+        # ==== 2) Перплексия (Qwen) ====
         pppl_df = ensure_pppl(df, cfg)
         pppl_df = pppl_df.set_index("idx").loc[df.index]
         pppl = pppl_df["pppl"].to_numpy().astype("float32")
-        # quality: низкая перплексия → лучше (но без особой хитрости)
-        log_pppl = np.log1p(pppl)
-        q_pppl = 1.0 - _minmax(log_pppl)
 
-        # ===== 3) Текстовые метрики (readability) =====
+        log_pppl = np.log1p(pppl)
+        q_pppl = 1.0 - _minmax(log_pppl)  # меньше лог-перплексии → лучше качество
+
+        # ==== 3) Текстовые метрики (readability) ====
         qual_df = ensure_quality_indicators(df, cfg)
         qual_df = qual_df.set_index("idx").loc[df.index]
         if "flesch_reading_ease" in qual_df.columns:
@@ -111,15 +178,13 @@ class HybridQDISel(BaseSelector):
         else:
             q_read = np.zeros_like(q_pppl, dtype=np.float32)
 
-        # общий quality-score
         q_score = 0.7 * q_pppl + 0.3 * q_read
         q_score = _minmax(q_score)
 
-        # ===== 4) Importance =====
+        # ==== 4) Importance ====
         if HAS_PRED_ENTROPY:
             ent_df = ensure_predictive_entropy(df, cfg)
             ent_df = ent_df.set_index("idx").loc[df.index]
-            # пытаемся угадать правильную колонку энтропии
             entropy_cols = [c for c in ent_df.columns if c not in ("idx",)]
             if not entropy_cols:
                 raise ValueError(
@@ -128,24 +193,21 @@ class HybridQDISel(BaseSelector):
             ent = ent_df[entropy_cols[0]].to_numpy(dtype=np.float32)
             i_score = _minmax(ent)
         else:
-            # fallback: "средняя" сложность — примеры не слишком простые и не экстремально сложные
+            # fallback: "средняя сложность" — ближе к медиане лог-перплексии → выше важность
             logp = log_pppl
             med = float(np.median(logp))
             dev = np.abs(logp - med)
-            # чем ближе к медиане → тем выше "важность"
             i_score = 1.0 - _minmax(dev)
 
-        # ===== 5) Diversity через KMeans-кластеры =====
-        rng_seed = int(getattr(cfg, "seed", 0)) if cfg is not None else 0
+        # ==== 5) Diversity через KMeans на CLS ====
+        rng_seed = int(getattr(cfg, "seed", 0))
         rng = np.random.default_rng(rng_seed)
 
         n = X.shape[0]
         if n <= self.n_clusters:
-            # тривиальный случай: кластеров больше, чем точек
             cluster_ids = np.zeros(n, dtype=int)
         else:
             if n > self.max_kmeans_points:
-                # подвыборка для обучения kmeans, потом predict на всех
                 idx_perm = rng.permutation(n)
                 fit_idx = idx_perm[: self.max_kmeans_points]
                 kmeans = KMeans(
@@ -173,7 +235,7 @@ class HybridQDISel(BaseSelector):
         d_score = 1.0 / counts[cluster_ids]
         d_score = _minmax(d_score)
 
-        # ===== 6) Комбинируем Q, D, I =====
+        # ==== 6) Комбинация Q, I, D ====
         qdi_score = (
             self.alpha_q * q_score
             + self.alpha_i * i_score
@@ -241,7 +303,8 @@ class HybridQDISel(BaseSelector):
             take = min(target_k, len(idx_cls))
             chosen_indices.extend(idx_cls[order[:take]].tolist())
 
-        chosen_indices = list(dict.fromkeys(chosen_indices))  # dedup
+        # dedup
+        chosen_indices = list(dict.fromkeys(chosen_indices))
 
         # если не дотянули до k — добираем глобально по qdi_score
         if len(chosen_indices) < k:
