@@ -12,7 +12,7 @@ data:
   max_length: 128
 
 model:
-  name: "answerdotai/ModernBERT-base"
+  name: "prajjwal1/bert-tiny"
 
 features:
   cache_dir: "features"
@@ -30,11 +30,18 @@ features:
 
 train:
   profile: "baseline"  # baseline | lora | ia3 | bitfit (not implemented in stub)
-  epochs: 1            # 1 epoch for smoke; change for real runs
+  epochs: 3         # 1 epoch for smoke; change for real runs
   batch_size: 16
   lr: 2e-5
   weight_decay: 0.01
   eval_steps: 100
+
+datadiet:
+  metric: "el2n"    # пока только EL2N
+  epochs: 1         # сколько эпох считать score (в BERT on a Data Diet показывают, что ≥1 эпохи уже ок)
+  batch_size: 32
+  lr: 2e-5          # можно взять из train.lr, если не хочешь дублировать
+
 
 eval:
   metrics: ["accuracy","f1"]

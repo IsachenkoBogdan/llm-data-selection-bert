@@ -28,6 +28,10 @@ data/processed/*
 data/manifests/*
 !data/manifests/.gitkeep
 hf_cache/
+.png
+.json
+.csv
+
 
 # OS / IDE
 .DS_Store

@@ -23,7 +23,9 @@ dependencies = [
   "joblib>=1.5.2",
   "sentencepiece>=0.2.1",
   "lexicalrichness>=0.5.1",
-  "evaluate>=0.4.6"
+  "rapidfuzz>=3.9.0",
+  "sentence-transformers>=2.7.0",
+  "google-generativeai>=0.8.0,<0.9.0"
 ]
 
 [project.optional-dependencies]

@@ -1,6 +1,5 @@
 import os
 
-# Force a non-interactive backend for headless environments (e.g. Snakemake runs)
 os.environ["MPLBACKEND"] = "Agg"
 
 import pandas as pd
