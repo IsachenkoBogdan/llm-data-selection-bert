@@ -20,4 +20,4 @@ class RandomSel(BaseSelector):
 
 class FullSel(BaseSelector):
     def select(self, df: pd.DataFrame, k: int) -> pd.DataFrame:
-        return df.iloc[:k] if k < len(df) else df
+        return df
