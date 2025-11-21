@@ -20,7 +20,7 @@ features:
     force_recompute: false
 
   pppl:
-    model_name: "Qwen/Qwen3-1.7B-Base"
+    model_name: "Qwen/Qwen3-0.6B-Base"
     batch_size: 4
     max_length: 256
     add_start_token: false
