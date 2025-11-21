@@ -1,10 +1,8 @@
-
 paths:
   data_dir: ${hydra:runtime.cwd}/data
   artifacts_dir: ${hydra:runtime.cwd}/artifacts
 
 seed: 42
-
 stage: "prepare"
 
 data:
@@ -12,50 +10,59 @@ data:
   max_length: 128
 
 model:
-  name: "prajjwal1/bert-tiny"
+  name: "answerdotai/ModernBERT-base"
 
 features:
   cache_dir: "features"
+
   embeddings:
     batch_size: 512
     force_recompute: false
+
   pppl:
     model_name: "Qwen/Qwen3-1.7B-Base"
     batch_size: 4
     max_length: 256
     add_start_token: false
     force_recompute: false
+
   quality:
     force_recompute: false
 
+  data_diet:
+    epochs: 1
+    batch_size: 32
+    lr: 2e-5
+    max_steps: 5000      # можешь уменьшить, если дорого
+    force_recompute: false
+
+  llm_clarity:
+    cache_path: "features/llm_clarity.parquet"
+    force_recompute: false
+
+  gemini_proxies:
+    cache_path: "features/gemini_proxies.parquet"
+    force_recompute: false
+
 train:
-  profile: "baseline"  # baseline | lora | ia3 | bitfit (not implemented in stub)
-  epochs: 3         # 1 epoch for smoke; change for real runs
+  profile: "baseline"     # baseline | lora | ia3 | bitfit
+  epochs: 1
   batch_size: 16
   lr: 2e-5
   weight_decay: 0.01
   eval_steps: 100
 
-features:
-  data_diet:
-    max_steps: 800
-    epochs: 2
-    batch_size: 32
-    lr: 2e-5
-
-
-
 eval:
-  metrics: ["accuracy","f1"]
+  metrics: ["accuracy", "f1"]
 
 subset:
   frac: 0.10
 
 track:
-  wandb_mode: "online"       # online | offline | disabled
+  wandb_mode: "online"    # online | offline | disabled
   project: "llm-data-selection-bert"
   entity: "dsteamswat"
 
 selection:
-  name: "random"             # random | kcenter | kmeans | herding | perplexity | full
+  name: "random"          # random | kcenter | kmeans | herding | datadiet | hybrid_qdi | ...
   params: {}
