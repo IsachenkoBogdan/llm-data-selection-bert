@@ -33,7 +33,7 @@ features:
     epochs: 1
     batch_size: 32
     lr: 2e-5
-    max_steps: 5000      # можешь уменьшить, если дорого
+    max_steps: 1000
     force_recompute: false
 
   llm_clarity:
@@ -45,8 +45,8 @@ features:
     force_recompute: false
 
 train:
-  profile: "baseline"     # baseline | lora | ia3 | bitfit
-  epochs: 1
+  profile: "baseline"
+  epochs: 4
   batch_size: 16
   lr: 2e-5
   weight_decay: 0.01

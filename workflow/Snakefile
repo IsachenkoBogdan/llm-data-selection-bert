@@ -1,7 +1,6 @@
 # Perplexity selector is available but excluded from batch runs to keep experiments light.
 STRATS = ["full", "random", "kcenter", "kmeans", "herding", "predictive_entropy", "wordpiece_ratio", "datadiet"]
 SUBS = {
-    "p05": 0.05,
     "p10": 0.10,
 }
 SEED = 42

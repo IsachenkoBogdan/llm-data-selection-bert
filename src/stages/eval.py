@@ -15,7 +15,6 @@ from ..utils import time_block
 
 
 def _p_tag(cfg) -> str:
-    # Совпадает с train.py и Snakefile: p05, p10, p20
     return f"p{int(round(cfg.subset.frac * 100)):02d}"
 
 
@@ -58,7 +57,7 @@ def run(cfg):
     training_args = TrainingArguments(
         output_dir=os.path.join(model_dir, "eval"),
         per_device_eval_batch_size=cfg.train.batch_size,
-        report_to=[],
+        report_to=[],  # чтобы Trainer сам ничего в wandb не писал
     )
 
     def _compute_metrics(pred):
@@ -74,14 +73,24 @@ def run(cfg):
     )
 
     with time_block() as elapsed:
-        result = trainer.evaluate()
+        # это нужно только для eval_loss и runtime, если хочешь
+        eval_result = trainer.evaluate()
     eval_time = elapsed()
 
-    metrics = {
-        key.replace("eval_", ""): float(value)
-        for key, value in result.items()
-        if key.startswith("eval_") and key != "eval_loss"
-    }
+    # Явно считаем preds и метрики, чтобы не зависеть от формата eval_result
+    pred_output = trainer.predict(eval_dataset)
+    y_true = pred_output.label_ids
+    y_pred = pred_output.predictions.argmax(-1)
+    core_metrics = compute_metrics(y_true, y_pred)
+    # приведём к float’ам
+    core_metrics = {k: float(v) for k, v in core_metrics.items()}
+
+    # можно добавить из eval_result полезное, если оно есть
+    extra_metrics = {}
+    if "eval_loss" in eval_result:
+        extra_metrics["loss"] = float(eval_result["eval_loss"])
+
+    metrics = {**core_metrics, **extra_metrics}
 
     metrics_path = os.path.join(
         "artifacts",
