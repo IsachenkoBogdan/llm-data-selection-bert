@@ -1,6 +1,7 @@
-import time
-from dataclasses import dataclass
-from typing import Any
+# src/features/data_diet.py
+from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -13,151 +14,145 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-EL2N_COL = "el2n"
+from ..utils import set_seed
+
 IDX_COL = "idx"
 
 
-@dataclass
-class DataDietConfig:
-    model_name: str = "answerdotai/ModernBERT-base"
-    max_length: int = 128
-    batch_size: int = 32
-    lr: float = 2e-5
-    epochs: int = 2
-    max_steps: int = 1000  # ограничение на число шагов (ранняя фаза)
+def _get_text_col(df: pd.DataFrame) -> str:
+    if "text" in df.columns:
+        return "text"
+    if "sentence" in df.columns:
+        return "sentence"
+    raise KeyError("Neither 'text' nor 'sentence' column found in dataframe.")
 
 
-def _get_dd_cfg(cfg: Any | None) -> DataDietConfig:
-    if cfg is None:
-        return DataDietConfig()
-
-    model_name = getattr(getattr(cfg, "model", None), "name", DataDietConfig.model_name)
-    max_length = getattr(getattr(cfg, "data", None), "max_length", DataDietConfig.max_length)
-
-    dd = getattr(getattr(cfg, "features", None), "data_diet", None)
-
-    return DataDietConfig(
-        model_name=getattr(dd, "model_name", model_name) if dd is not None else model_name,
-        max_length=getattr(dd, "max_length", max_length) if dd is not None else max_length,
-        batch_size=getattr(dd, "batch_size", DataDietConfig.batch_size) if dd is not None else DataDietConfig.batch_size,
-        lr=getattr(dd, "lr", DataDietConfig.lr) if dd is not None else DataDietConfig.lr,
-        epochs=getattr(dd, "epochs", DataDietConfig.epochs) if dd is not None else DataDietConfig.epochs,
-        max_steps=getattr(dd, "max_steps", DataDietConfig.max_steps) if dd is not None else DataDietConfig.max_steps,
-    )
+def _get_cache_path(cfg) -> Path:
+    base_dir = getattr(getattr(cfg, "features", None), "cache_dir", "features")
+    return Path(base_dir) / "el2n_scores.parquet"
 
 
-def ensure_el2n_scores(df: pd.DataFrame, cfg: Any | None = None) -> pd.DataFrame:
-    """Рассчитать EL2N-score для каждого примера в df (train-часть)."""
+def ensure_el2n_scores(df: pd.DataFrame, cfg) -> pd.DataFrame:
+    cache_path = _get_cache_path(cfg)
+    force = bool(getattr(getattr(cfg.features, "data_diet", None), "force_recompute", False))
 
-    dd_cfg = _get_dd_cfg(cfg)
-    seed = int(getattr(cfg, "seed", 42)) if cfg is not None else 42
+    if cache_path.exists() and not force:
+        return pd.read_parquet(cache_path)
 
-    rng = np.random.default_rng(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-    df_local = df.reset_index(drop=True).copy()
-    n = len(df_local)
-    df_local[IDX_COL] = np.arange(n, dtype=int)
+    set_seed(int(getattr(cfg, "seed", 42)))
+
+    text_col = _get_text_col(df)
+    df_local = df.reset_index(drop=False).rename(columns={"index": IDX_COL})
+
+    if "label" not in df_local.columns:
+        raise KeyError("DataFrame must contain 'label' column for DataDiet.")
 
     hf_ds = Dataset.from_pandas(
-        df_local[[IDX_COL, "sentence", "label"]],
+        df_local[[IDX_COL, text_col, "label"]],
         preserve_index=False,
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(dd_cfg.model_name, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.name, use_fast=True)
 
-    def _encode(batch: dict[str, list[Any]]) -> dict[str, Any]:
+    def encode(batch):
         enc = tokenizer(
-            batch["sentence"],
+            batch[text_col],
             truncation=True,
             padding="max_length",
-            max_length=dd_cfg.max_length,
+            max_length=cfg.data.max_length,
         )
         enc["labels"] = batch["label"]
         enc[IDX_COL] = batch[IDX_COL]
         return enc
 
-    hf_ds = hf_ds.map(_encode, batched=True, remove_columns=["sentence", "label"])
-    hf_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels", IDX_COL])
+    hf_ds = hf_ds.map(encode, batched=True)
+    hf_ds.set_format(
+        type="torch",
+        columns=["input_ids", "attention_mask", "labels", IDX_COL],
+    )
 
-    dataloader = DataLoader(
-        hf_ds,
-        batch_size=dd_cfg.batch_size,
-        shuffle=True,
+    model = AutoModelForSequenceClassification.from_pretrained(
+        cfg.model.name,
+        num_labels=2,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AutoModelForSequenceClassification.from_pretrained(
-        dd_cfg.model_name,
-        num_labels=2,
-    ).to(device)
+    model.to(device)
+    model.train()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=dd_cfg.lr)
+    dd_cfg = getattr(cfg.features, "data_diet", None)
+    epochs = int(getattr(dd_cfg, "epochs", 1))
+    batch_size = int(getattr(dd_cfg, "batch_size", 32))
+    lr = float(getattr(dd_cfg, "lr", 2e-5))
+    max_steps = int(getattr(dd_cfg, "max_steps", 0))  # 0 = без лимита
 
-    total_steps = dd_cfg.epochs * len(dataloader)
-    max_steps = min(dd_cfg.max_steps, total_steps)
-    num_warmup = max(1, max_steps // 10)
+    loader = DataLoader(hf_ds, batch_size=batch_size, shuffle=True)
 
+    optim = torch.optim.AdamW(model.parameters(), lr=lr)
+    total_steps = epochs * len(loader)
+    if max_steps and max_steps < total_steps:
+        total_steps = max_steps
     scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=num_warmup,
-        num_training_steps=max_steps,
+        optim,
+        num_warmup_steps=max(1, total_steps // 10),
+        num_training_steps=total_steps,
     )
 
-    scores = np.zeros(n, dtype=np.float64)
-    counts = np.zeros(n, dtype=np.int32)
+    n = len(df_local)
+    el2n_sum = np.zeros(n, dtype=np.float32)
+    el2n_cnt = np.zeros(n, dtype=np.int32)
 
     step = 0
-    t0 = time.time()
+    num_labels = 2
 
-    for epoch in range(dd_cfg.epochs):
-        model.train()
-        for batch in dataloader:
+    for _ in range(epochs):
+        for batch in loader:
             step += 1
-            if step > max_steps:
-                break
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-            idx_batch = batch[IDX_COL].cpu().numpy()
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
+            optim.zero_grad()
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
             )
 
-            with torch.no_grad():
-                probs = torch.softmax(outputs.logits, dim=-1)
-                one_hot = torch.nn.functional.one_hot(labels, num_classes=probs.size(-1)).float()
-                el2n = torch.sum((probs - one_hot) ** 2, dim=-1)  # [B]
-                el2n_np = el2n.cpu().numpy()
+            logits = out.logits.detach()
+            probs = torch.softmax(logits, dim=-1)
+            labels_oh = torch.nn.functional.one_hot(
+                batch["labels"],
+                num_classes=num_labels,
+            ).float()
 
-            scores[idx_batch] += el2n_np
-            counts[idx_batch] += 1
+            el2n_batch = torch.linalg.norm(labels_oh - probs, dim=-1)
 
-            loss = outputs.loss
+            idx_np = batch[IDX_COL].cpu().numpy()
+            val_np = el2n_batch.cpu().numpy()
+            el2n_sum[idx_np] += val_np
+            el2n_cnt[idx_np] += 1
+
+            loss = out.loss
             loss.backward()
-            optimizer.step()
+            optim.step()
             scheduler.step()
-            optimizer.zero_grad()
 
-        if step > max_steps:
+            if max_steps and step >= max_steps:
+                break
+        if max_steps and step >= max_steps:
             break
 
-    elapsed = time.time() - t0
-    print(f"[DataDiet] computed EL2N for {n} examples in {elapsed:.1f}s "
-          f"({step} steps, epochs_used≈{step / max(len(dataloader), 1):.2f})")
+    mask = el2n_cnt > 0
+    el2n = np.zeros(n, dtype=np.float32)
+    el2n[mask] = el2n_sum[mask] / el2n_cnt[mask]
 
-    counts[counts == 0] = 1
-    scores = scores / counts
-
-    return pd.DataFrame(
+    scores_df = pd.DataFrame(
         {
-            IDX_COL: df_local[IDX_COL].to_numpy(),
-            EL2N_COL: scores.astype(np.float32),
+            IDX_COL: np.arange(n, dtype=np.int64),
+            "el2n": el2n,
         }
     )
+
+    scores_df.to_parquet(cache_path, index=False)
+    return scores_df
