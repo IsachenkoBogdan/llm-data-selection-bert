@@ -4,6 +4,7 @@ from .statistical import PredictiveEntropySel, WordPieceRatioSel
 from .llm_quality import LLMQualitySel
 from .datadiet import DataDietSel
 from .hybrid import HybridQDISel
+from .quality import PerplexitySel
 
 REGISTRY = {
     "random": RandomSel,
@@ -16,4 +17,5 @@ REGISTRY = {
     "llm_quality": LLMQualitySel,
     "datadiet": DataDietSel,
     "hybrid_qdi": HybridQDISel,
+    "perplexity": PerplexitySel
 }

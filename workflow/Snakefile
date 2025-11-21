@@ -1,5 +1,5 @@
 # Perplexity selector is available but excluded from batch runs to keep experiments light.
-STRATS = ["full", "random", "kcenter", "kmeans", "herding", "predictive_entropy", "wordpiece_ratio", "datadiet"]
+STRATS = ["hybrid_qdi", ]
 SUBS = {
     "p10": 0.10,
 }
