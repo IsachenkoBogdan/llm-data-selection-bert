@@ -10,7 +10,7 @@ data:
   max_length: 128
 
 model:
-  name: "answerdotai/ModernBERT-base"
+  name: "prajjwal1/bert-tiny"
 
 features:
   cache_dir: "features"
