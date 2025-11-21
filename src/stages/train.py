@@ -53,7 +53,8 @@ def run(cfg):
     )
 
     model = AutoModelForSequenceClassification.from_pretrained(
-        cfg.model.name, num_labels=2
+        cfg.model.name,
+        num_labels=2,
     )
 
     out_dir = os.path.join(
@@ -81,24 +82,37 @@ def run(cfg):
         eval_strategy="steps",
     )
 
+    def _compute_metrics(pred):
+        preds = pred.predictions.argmax(-1)
+        return compute_metrics(pred.label_ids, preds)
+
     trainer = Trainer(
         model=model,
         args=args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
         tokenizer=tokenizer,
-        compute_metrics=lambda p: compute_metrics(
-            p.label_ids, p.predictions.argmax(-1)
-        ),
+        compute_metrics=_compute_metrics,
     )
 
     with time_block() as elapsed:
         trainer.train()
     train_time = elapsed()
 
-    metrics = trainer.evaluate()
-    trainer.save_model(out_dir)
-    tokenizer.save_pretrained(out_dir)
+    # Явно считаем метрики по валидации, как в eval.py
+    eval_result = trainer.evaluate()
+    pred_output = trainer.predict(val_ds)
+    y_true = pred_output.label_ids
+    y_pred = pred_output.predictions.argmax(-1)
+
+    core_metrics = compute_metrics(y_true, y_pred)
+    core_metrics = {k: float(v) for k, v in core_metrics.items()}  # accuracy, f1, precision, recall
+
+    extra_metrics = {}
+    if "eval_loss" in eval_result:
+        extra_metrics["loss"] = float(eval_result["eval_loss"])
+
+    metrics = {**core_metrics, **extra_metrics}
 
     metrics_path = os.path.join(os.path.dirname(out_dir), "train_metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
@@ -107,11 +121,20 @@ def run(cfg):
     if cfg.track.wandb_mode != "disabled" and wandb.run:
         wandb.log(
             {
-                **{f"train/{key}": float(value) for key, value in metrics.items()},
+                **{f"train/{key}" for key in []},  # заглушка, чтобы не забыть что тут есть логика ниже
+            }
+        )
+        # нормальный лог — одним словарём
+        wandb.log(
+            {
+                **{f"train/{k}": v for k, v in metrics.items()},
                 "train/examples": len(train_df),
                 "train/validation_examples": len(val_df),
                 "train/time_sec": train_time,
             }
         )
+
+    trainer.save_model(out_dir)
+    tokenizer.save_pretrained(out_dir)
 
     return out_dir
