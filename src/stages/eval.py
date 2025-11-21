@@ -1,5 +1,6 @@
 import json
 import os
+
 import wandb
 from datasets import load_dataset
 from transformers import (
@@ -13,13 +14,20 @@ from ..metrics import compute_metrics
 from ..utils import time_block
 
 
+def _p_tag(cfg) -> str:
+    # Совпадает с train.py и Snakefile: p05, p10, p20
+    return f"p{int(round(cfg.subset.frac * 100)):02d}"
+
+
 def run(cfg):
     dataset = load_dataset("glue", "sst2", split="validation")
+
+    p_tag = _p_tag(cfg)
 
     model_dir = os.path.join(
         "artifacts",
         cfg.selection.name,
-        f"p{int(round(cfg.subset.frac * 100)):02d}",
+        p_tag,
         f"seed{cfg.seed}",
         "model",
     )
@@ -78,7 +86,7 @@ def run(cfg):
     metrics_path = os.path.join(
         "artifacts",
         cfg.selection.name,
-        f"p{int(cfg.subset.frac * 100)}",
+        p_tag,
         f"seed{cfg.seed}",
         "metrics.json",
     )
@@ -87,9 +95,11 @@ def run(cfg):
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
     if cfg.track.wandb_mode != "disabled" and wandb.run is not None:
-        wandb.log({
-            "eval/time_sec": eval_time,
-            **{f"eval/{k}": v for k, v in metrics.items()},
-        })
+        wandb.log(
+            {
+                "eval/time_sec": eval_time,
+                **{f"eval/{k}": v for k, v in metrics.items()},
+            }
+        )
 
     return metrics_path
