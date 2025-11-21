@@ -1,5 +1,5 @@
 # Perplexity selector is available but excluded from batch runs to keep experiments light.
-STRATS = ["hybrid_qdi", ]
+STRATS = ["hybrid_qdi", "perplexity"]
 SUBS = {
     "p10": 0.10,
 }
