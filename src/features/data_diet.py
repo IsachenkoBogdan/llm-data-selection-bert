@@ -1,173 +1,163 @@
-# src/features/data_diet.py
-
-from __future__ import annotations
-
+import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from datasets import Dataset
+from torch.utils.data import DataLoader
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    get_linear_schedule_with_warmup,
+)
+
+EL2N_COL = "el2n"
+IDX_COL = "idx"
 
 
-def _infer_text_column(df: pd.DataFrame) -> str:
-    """
-    Определяем, где лежит текст: в 'text' или в 'sentence'.
-    Бросаем внятную ошибку, если ничего не нашли.
-    """
-    if "text" in df.columns:
-        return "text"
-    if "sentence" in df.columns:
-        return "sentence"
-    raise ValueError(
-        f"ensure_el2n_scores: expected df to have 'text' or 'sentence' column, got: {list(df.columns)}"
+@dataclass
+class DataDietConfig:
+    model_name: str = "answerdotai/ModernBERT-base"
+    max_length: int = 128
+    batch_size: int = 32
+    lr: float = 2e-5
+    epochs: int = 2
+    max_steps: int = 1000  # ограничение на число шагов (ранняя фаза)
+
+
+def _get_dd_cfg(cfg: Any | None) -> DataDietConfig:
+    if cfg is None:
+        return DataDietConfig()
+
+    model_name = getattr(getattr(cfg, "model", None), "name", DataDietConfig.model_name)
+    max_length = getattr(getattr(cfg, "data", None), "max_length", DataDietConfig.max_length)
+
+    dd = getattr(getattr(cfg, "features", None), "data_diet", None)
+
+    return DataDietConfig(
+        model_name=getattr(dd, "model_name", model_name) if dd is not None else model_name,
+        max_length=getattr(dd, "max_length", max_length) if dd is not None else max_length,
+        batch_size=getattr(dd, "batch_size", DataDietConfig.batch_size) if dd is not None else DataDietConfig.batch_size,
+        lr=getattr(dd, "lr", DataDietConfig.lr) if dd is not None else DataDietConfig.lr,
+        epochs=getattr(dd, "epochs", DataDietConfig.epochs) if dd is not None else DataDietConfig.epochs,
+        max_steps=getattr(dd, "max_steps", DataDietConfig.max_steps) if dd is not None else DataDietConfig.max_steps,
     )
 
 
-class _EL2NDataset(Dataset):
-    """
-    Простой Dataset, который хранит (idx, sentence, label) и отдаёт их по одному.
-    """
+def ensure_el2n_scores(df: pd.DataFrame, cfg: Any | None = None) -> pd.DataFrame:
+    """Рассчитать EL2N-score для каждого примера в df (train-часть)."""
 
-    def __init__(self, df_with_idx: pd.DataFrame):
-        # ожидаем колонки: idx, sentence, label
-        self._sentences = df_with_idx["sentence"].astype(str).tolist()
-        self._labels = df_with_idx["label"].astype(int).tolist()
-        self._idx = df_with_idx["idx"].astype(int).tolist()
+    dd_cfg = _get_dd_cfg(cfg)
+    seed = int(getattr(cfg, "seed", 42)) if cfg is not None else 42
 
-    def __len__(self) -> int:
-        return len(self._sentences)
-
-    def __getitem__(self, i: int) -> dict[str, Any]:
-        return {
-            "idx": self._idx[i],
-            "sentence": self._sentences[i],
-            "label": self._labels[i],
-        }
-
-
-def ensure_el2n_scores(df: pd.DataFrame, cfg) -> pd.DataFrame:
-    """
-    Упрощённая реализация Data Diet / EL2N:
-
-    - Берём модель cfg.model.name (ModernBERT),
-    - Делаем ОДИН проход по датасету без обучения,
-    - Для каждого примера считаем:
-        * p = softmax(logits)
-        * y_onehot = one_hot(label)
-        * el2n = ||p - y_onehot||_2
-        * ce_loss = cross-entropy(logits, label)
-    - Возвращаем DataFrame с колонками: idx, el2n, ce_loss
-
-    Важно:
-    - idx == исходный индекс df (после reset_index), чтобы селектор мог
-      выровнять по df.index.
-    """
-
-    if "label" not in df.columns:
-        raise ValueError("ensure_el2n_scores: expected 'label' column in df")
-
-    text_col = _infer_text_column(df)
-
-    # добавляем явный idx и переименовываем текст → 'sentence'
-    df_with_idx = (
-        df.reset_index(drop=False)
-        .rename(columns={"index": "idx", text_col: "sentence"})
-        [["idx", "sentence", "label"]]
-        .copy()
-    )
-
-    # ---- конфиги / гиперпараметры из cfg ----
-    model_name = getattr(getattr(cfg, "model", None), "name", None) or "answerdotai/ModernBERT-base"
-    max_length = getattr(getattr(cfg, "data", None), "max_length", 128)
-    batch_size = getattr(getattr(cfg, "train", None), "batch_size", 32)
-    seed = int(getattr(cfg, "seed", 42))
-
+    rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    # ---- токенизатор и модель ----
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+    df_local = df.reset_index(drop=True).copy()
+    n = len(df_local)
+    df_local[IDX_COL] = np.arange(n, dtype=int)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()
+    hf_ds = Dataset.from_pandas(
+        df_local[[IDX_COL, "sentence", "label"]],
+        preserve_index=False,
+    )
 
-    # ---- Dataset / DataLoader ----
-    dataset = _EL2NDataset(df_with_idx)
+    tokenizer = AutoTokenizer.from_pretrained(dd_cfg.model_name, use_fast=True)
 
-    def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
-        sentences = [b["sentence"] for b in batch]
-        labels = torch.tensor([b["label"] for b in batch], dtype=torch.long)
-        idx = torch.tensor([b["idx"] for b in batch], dtype=torch.long)
-
+    def _encode(batch: dict[str, list[Any]]) -> dict[str, Any]:
         enc = tokenizer(
-            sentences,
+            batch["sentence"],
             truncation=True,
             padding="max_length",
-            max_length=max_length,
-            return_tensors="pt",
+            max_length=dd_cfg.max_length,
         )
-        enc["labels"] = labels
-        enc["idx"] = idx
+        enc["labels"] = batch["label"]
+        enc[IDX_COL] = batch[IDX_COL]
         return enc
 
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_fn,
+    hf_ds = hf_ds.map(_encode, batched=True, remove_columns=["sentence", "label"])
+    hf_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels", IDX_COL])
+
+    dataloader = DataLoader(
+        hf_ds,
+        batch_size=dd_cfg.batch_size,
+        shuffle=True,
     )
 
-    # ---- проходим по датасету и считаем EL2N ----
-    all_idx: list[int] = []
-    all_el2n: list[float] = []
-    all_ce: list[float] = []
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForSequenceClassification.from_pretrained(
+        dd_cfg.model_name,
+        num_labels=2,
+    ).to(device)
 
-    with torch.no_grad():
-        for batch in loader:
-            idx = batch["idx"].cpu().numpy()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=dd_cfg.lr)
+
+    total_steps = dd_cfg.epochs * len(dataloader)
+    max_steps = min(dd_cfg.max_steps, total_steps)
+    num_warmup = max(1, max_steps // 10)
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup,
+        num_training_steps=max_steps,
+    )
+
+    scores = np.zeros(n, dtype=np.float64)
+    counts = np.zeros(n, dtype=np.int32)
+
+    step = 0
+    t0 = time.time()
+
+    for epoch in range(dd_cfg.epochs):
+        model.train()
+        for batch in dataloader:
+            step += 1
+            if step > max_steps:
+                break
+
+            idx_batch = batch[IDX_COL].cpu().numpy()
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            # убираем служебные поля из batch перед подачей в модель
-            model_inputs = {
-                k: v.to(device)
-                for k, v in batch.items()
-                if k not in ("labels", "idx")
-            }
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
 
-            outputs = model(**model_inputs)
-            logits = outputs.logits
-            probs = F.softmax(logits, dim=-1)
+            with torch.no_grad():
+                probs = torch.softmax(outputs.logits, dim=-1)
+                one_hot = torch.nn.functional.one_hot(labels, num_classes=probs.size(-1)).float()
+                el2n = torch.sum((probs - one_hot) ** 2, dim=-1)  # [B]
+                el2n_np = el2n.cpu().numpy()
 
-            # one-hot метки
-            num_classes = probs.shape[-1]
-            one_hot = F.one_hot(labels, num_classes=num_classes).float()
+            scores[idx_batch] += el2n_np
+            counts[idx_batch] += 1
 
-            # EL2N = ||p - y||_2
-            diff = probs - one_hot
-            el2n_batch = torch.sqrt(torch.sum(diff * diff, dim=-1))
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
-            # CE loss (per-example)
-            ce_batch = F.cross_entropy(logits, labels, reduction="none")
+        if step > max_steps:
+            break
 
-            all_idx.extend(idx.tolist())
-            all_el2n.extend(el2n_batch.cpu().numpy().tolist())
-            all_ce.extend(ce_batch.cpu().numpy().tolist())
+    elapsed = time.time() - t0
+    print(f"[DataDiet] computed EL2N for {n} examples in {elapsed:.1f}s "
+          f"({step} steps, epochs_used≈{step / max(len(dataloader), 1):.2f})")
 
-    # ---- собираем DataFrame ----
-    scores_df = pd.DataFrame(
+    counts[counts == 0] = 1
+    scores = scores / counts
+
+    return pd.DataFrame(
         {
-            "idx": all_idx,
-            "el2n": all_el2n,
-            "ce_loss": all_ce,
+            IDX_COL: df_local[IDX_COL].to_numpy(),
+            EL2N_COL: scores.astype(np.float32),
         }
     )
-
-    # на всякий случай сортируем по idx
-    scores_df = scores_df.sort_values("idx").reset_index(drop=True)
-
-    return scores_df
