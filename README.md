@@ -2,7 +2,7 @@
 
 Stage-first framework for studying **data subset selection** (quality / diversity / importance) on GLUE SST-2 with ModernBERT.
 
-The project is inspired by the taxonomy from [Data Selection for LLM Instruction Tuning](https://arxiv.org/pdf/2408.02085), which выделяет три ключевых аспекта:
+Проект создан на основе исследование [Data Selection for LLM Instruction Tuning](https://arxiv.org/pdf/2408.02085), в котором авторы выделяют три ключевых аспекта:
 
 - **Quality** — насколько примеры чистые, грамматичные, с однозначной разметкой.
 - **Diversity** — насколько поднабор покрывает разные области feature-space.
