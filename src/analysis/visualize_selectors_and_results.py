@@ -5,20 +5,21 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# >>> добавь это до любых импортов matplotlib
+# backend должен быть установлен до импортов matplotlib
 os.environ["MPLBACKEND"] = "Agg"
 
 import matplotlib
+
 matplotlib.use("Agg", force=True)
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import umap
-from omegaconf import OmegaConf
 
-from src.features import ensure_modernbert_cls
-from src.selectors import REGISTRY
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import umap  # noqa: E402
+from omegaconf import OmegaConf  # noqa: E402
 
+from ..features.embeddings import compute_modernbert_embeddings  # noqa: E402
+from ..selectors import REGISTRY  # noqa: E402
 
 # ====================== общие настройки оформления ======================
 
@@ -45,25 +46,33 @@ plt.rcParams.update(
     }
 )
 
-
 # ====================== UMAP по селекторам ======================
 
-def compute_umap_embeddings(cfg_path: str = "conf/config.yaml") -> tuple[pd.DataFrame, np.ndarray]:
+
+def compute_umap_embeddings(
+    cfg_path: str = "conf/config.yaml",
+) -> tuple[pd.DataFrame, np.ndarray]:
     cfg = OmegaConf.load(cfg_path)
 
     data_path = Path("data/processed/sst2.parquet")
     if not data_path.exists():
         raise FileNotFoundError(
             f"{data_path} не найден. Сначала запусти prepare: "
-            "uv run python -m src.pipeline stage=prepare"
+            "uv run python -m src.pipeline stage=prepare",
         )
 
     df = pd.read_parquet(data_path)
 
-    emb_df = ensure_modernbert_cls(df, cfg)  # idx, emb_0, emb_1, ...
-    emb_df = emb_df.set_index("idx").loc[df.index]
-    emb_cols = [c for c in emb_df.columns if c.startswith("emb_")]
-    X = emb_df[emb_cols].to_numpy()
+    model_name = getattr(cfg.model, "name", "answerdotai/ModernBERT-base")
+    max_len = int(getattr(cfg.data, "max_length", 128))
+    batch_size = int(getattr(cfg.analysis, "umap_batch_size", 256))
+
+    emb = compute_modernbert_embeddings(
+        df["text"],
+        model_name=model_name,
+        max_length=max_len,
+        batch_size=batch_size,
+    )
 
     reducer = umap.UMAP(
         n_components=2,
@@ -72,13 +81,13 @@ def compute_umap_embeddings(cfg_path: str = "conf/config.yaml") -> tuple[pd.Data
         metric="cosine",
         random_state=int(getattr(cfg, "seed", 42)),
     )
-    X2d = reducer.fit_transform(X)
+    x2d = reducer.fit_transform(emb)
 
     df_umap = df.copy()
-    df_umap["umap_x"] = X2d[:, 0]
-    df_umap["umap_y"] = X2d[:, 1]
+    df_umap["umap_x"] = x2d[:, 0]
+    df_umap["umap_y"] = x2d[:, 1]
 
-    return df_umap, X2d
+    return df_umap, x2d
 
 
 def plot_selectors_umap(
@@ -134,7 +143,6 @@ def plot_selectors_umap(
         for spine in ax.spines.values():
             spine.set_color("white")
 
-        # фон: все точки
         ax.scatter(
             x_all,
             y_all,
@@ -144,7 +152,6 @@ def plot_selectors_umap(
             linewidths=0,
         )
 
-        # выбираем селектором
         if name not in REGISTRY:
             ax.set_title(f"{name} (NOT FOUND)", fontsize=11, color="red")
             ax.set_xticks([])
@@ -185,6 +192,7 @@ def plot_selectors_umap(
 
 
 # ====================== графики по табличке результатов ======================
+
 
 def make_results_df() -> pd.DataFrame:
     data = {
@@ -271,8 +279,8 @@ def plot_compute_times(
 
 # ====================== main ======================
 
+
 def main() -> None:
-    # 1) UMAP
     df_umap, _ = compute_umap_embeddings()
 
     selector_names = [
@@ -292,7 +300,6 @@ def main() -> None:
         seed=42,
     )
 
-    # 2) графики по табличке результатов
     df_res = make_results_df()
     plot_accuracy_f1(df_res)
     plot_compute_times(df_res)
