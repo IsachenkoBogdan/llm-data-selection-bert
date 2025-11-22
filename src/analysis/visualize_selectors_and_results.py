@@ -1,11 +1,8 @@
-# src/analysis/visualize_selectors_and_results.py
-
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-# backend до любых импортов matplotlib
 os.environ["MPLBACKEND"] = "Agg"
 
 import matplotlib  # noqa: E402
@@ -61,7 +58,17 @@ def compute_umap_embeddings(
 
     df = pd.read_parquet(data_path)
 
-    # берём настройки модели из конфига, если они там есть
+    # выбираем колонку с текстом
+    if "sentence" in df.columns:
+        text_col = "sentence"
+    elif "text" in df.columns:
+        text_col = "text"
+    else:
+        raise KeyError(
+            f"Не найдено поле с текстом ('sentence' или 'text'). "
+            f"Колонки в df: {list(df.columns)}"
+        )
+
     if "model" in cfg and "name" in cfg.model:
         model_name = cfg.model.name
     else:
@@ -72,7 +79,6 @@ def compute_umap_embeddings(
     else:
         max_length = 128
 
-    # секции analysis может не быть — берём дефолт 256
     analysis_cfg = cfg.get("analysis", {})
     if isinstance(analysis_cfg, dict):
         batch_size = int(analysis_cfg.get("umap_batch_size", 256))
@@ -80,7 +86,7 @@ def compute_umap_embeddings(
         batch_size = int(getattr(analysis_cfg, "umap_batch_size", 256))
 
     emb = compute_modernbert_embeddings(
-        df["sentence"],
+        df[text_col],
         model_name=model_name,
         max_length=max_length,
         batch_size=batch_size,
