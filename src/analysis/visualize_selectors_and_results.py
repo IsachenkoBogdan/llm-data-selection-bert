@@ -5,13 +5,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# backend должен быть установлен до импортов matplotlib
+# backend до любых импортов matplotlib
 os.environ["MPLBACKEND"] = "Agg"
 
-import matplotlib
-
-matplotlib.use("Agg", force=True)
-
+import matplotlib  # noqa: E402
+matplotlib.use("Agg", force=True)  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -21,7 +19,6 @@ from omegaconf import OmegaConf  # noqa: E402
 from ..features.embeddings import compute_modernbert_embeddings  # noqa: E402
 from ..selectors import REGISTRY  # noqa: E402
 
-# ====================== общие настройки оформления ======================
 
 plt.rcParams.update(
     {
@@ -46,6 +43,7 @@ plt.rcParams.update(
     }
 )
 
+
 # ====================== UMAP по селекторам ======================
 
 
@@ -58,21 +56,44 @@ def compute_umap_embeddings(
     if not data_path.exists():
         raise FileNotFoundError(
             f"{data_path} не найден. Сначала запусти prepare: "
-            "uv run python -m src.pipeline stage=prepare",
+            "uv run python -m src.pipeline stage=prepare"
         )
 
     df = pd.read_parquet(data_path)
 
-    model_name = getattr(cfg.model, "name", "answerdotai/ModernBERT-base")
-    max_len = int(getattr(cfg.data, "max_length", 128))
-    batch_size = int(getattr(cfg.analysis, "umap_batch_size", 256))
+    # берём настройки модели из конфига, если они там есть
+    if "model" in cfg and "name" in cfg.model:
+        model_name = cfg.model.name
+    else:
+        model_name = "answerdotai/ModernBERT-base"
+
+    if "data" in cfg and "max_length" in cfg.data:
+        max_length = int(cfg.data.max_length)
+    else:
+        max_length = 128
+
+    # секции analysis может не быть — берём дефолт 256
+    analysis_cfg = cfg.get("analysis", {})
+    if isinstance(analysis_cfg, dict):
+        batch_size = int(analysis_cfg.get("umap_batch_size", 256))
+    else:
+        batch_size = int(getattr(analysis_cfg, "umap_batch_size", 256))
 
     emb = compute_modernbert_embeddings(
-        df["text"],
+        df["sentence"],
         model_name=model_name,
-        max_length=max_len,
+        max_length=max_length,
         batch_size=batch_size,
     )
+
+    emb_df = pd.DataFrame(
+        emb,
+        index=df.index,
+        columns=[f"emb_{i}" for i in range(emb.shape[1])],
+    )
+
+    emb_cols = [c for c in emb_df.columns if c.startswith("emb_")]
+    X = emb_df[emb_cols].to_numpy()
 
     reducer = umap.UMAP(
         n_components=2,
@@ -81,13 +102,13 @@ def compute_umap_embeddings(
         metric="cosine",
         random_state=int(getattr(cfg, "seed", 42)),
     )
-    x2d = reducer.fit_transform(emb)
+    X2d = reducer.fit_transform(X)
 
     df_umap = df.copy()
-    df_umap["umap_x"] = x2d[:, 0]
-    df_umap["umap_y"] = x2d[:, 1]
+    df_umap["umap_x"] = X2d[:, 0]
+    df_umap["umap_y"] = X2d[:, 1]
 
-    return df_umap, x2d
+    return df_umap, X2d
 
 
 def plot_selectors_umap(
@@ -191,9 +212,6 @@ def plot_selectors_umap(
     plt.close(fig)
 
 
-# ====================== графики по табличке результатов ======================
-
-
 def make_results_df() -> pd.DataFrame:
     data = {
         "method": [
@@ -275,9 +293,6 @@ def plot_compute_times(
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, transparent=True)
     plt.close(fig)
-
-
-# ====================== main ======================
 
 
 def main() -> None:
