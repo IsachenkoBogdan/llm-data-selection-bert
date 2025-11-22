@@ -1,5 +1,3 @@
-Вот обновлённый README под твой текущий зоопарк методов.
-
 # llm-data-selection-bert
 
 Stage-first framework for studying **data subset selection** (quality / diversity / importance) on GLUE SST-2 with ModernBERT.
@@ -407,4 +405,19 @@ echo WANDB_API_KEY=... >> .env
 * время обучения,
 * время селекции,
 * размер поднабора и базовую статистику (class balance, avg length).
+
+## 9. Результаты
+
+| Метод                 | Accuracy |   F1   | Train compute time, sec | Selection compute time, sec |
+|-----------------------|:--------:|:------:|:------------------------:|:----------------------------:|
+| Full                  |  0.809   | 0.812  |          1280            |             0                |
+| Random                |  0.747   | 0.746  |           48             |             0                |
+| *Word-piece ratio*    |  0.783   | 0.787  |           48             |            13                |
+| Perplexity            |  0.749   | 0.742  |           48             |           4700               |
+| LLM-based classifier  |  0.781   | 0.778  |           48             |           4787               |
+| K-center              |  0.774   | 0.768  |           48             |            560               |
+| Herding               |  0.763   | 0.768  |           48             |            120               |
+| EL2N                  |  0.642   | 0.596  |           48             |             20               |
+| **Гибрид (Q + D)**    | **0.792**| **0.789** |        48             |          **4920**            |
+
 
