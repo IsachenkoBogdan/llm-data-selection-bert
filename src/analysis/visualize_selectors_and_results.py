@@ -1,10 +1,15 @@
-# analysis/visualize_selectors_and_results.py
+# src/analysis/visualize_selectors_and_results.py
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
+# >>> добавь это до любых импортов matplotlib
+os.environ["MPLBACKEND"] = "Agg"
+
+import matplotlib
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -13,6 +18,7 @@ from omegaconf import OmegaConf
 
 from src.features import ensure_modernbert_cls
 from src.selectors import REGISTRY
+
 
 # ====================== общие настройки оформления ======================
 
