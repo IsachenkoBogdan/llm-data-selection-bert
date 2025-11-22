@@ -179,7 +179,7 @@ def plot_selectors_umap(
             linewidths=0,
         )
 
-        if name not in REGISTRY:
+        if name not in REGISTRY and name in ['perplexity', 'hybrid_qdi', 'llm_quality']:
             ax.set_title(f"{name} (NOT FOUND)", fontsize=11, color="red")
             ax.set_xticks([])
             ax.set_yticks([])
