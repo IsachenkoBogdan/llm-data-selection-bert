@@ -163,14 +163,37 @@ class HybridQDISel(BaseSelector):
 
         # ==== 2) Перплексия (Qwen) ====
         # ensure_pppl ожидает (cfg, df), но возвращает tuple или DF
-        pppl_out = ensure_pppl(cfg, df)
-        if isinstance(pppl_out, tuple):
-            pppl_df = pppl_out[0]
-        else:
-            pppl_df = pppl_out
+        pppl_df = ensure_pppl(cfg, df)
 
-        pppl_df = pppl_df.set_index("idx").loc[df.index]
-        pppl = pppl_df["pppl"].to_numpy().astype("float32")
+        # если вдруг ensure_pppl возвращает (df, meta) — берем первую часть
+        if isinstance(pppl_df, tuple):
+            pppl_df = pppl_df[0]
+
+        if not isinstance(pppl_df, pd.DataFrame):
+            raise TypeError("ensure_pppl() must return a pandas.DataFrame")
+
+        # если есть колонка idx — выравниваем по исходному df
+        if "idx" in pppl_df.columns:
+            pppl_df = pppl_df.set_index("idx").loc[df.index]
+
+        # пытаемся вытащить сам скор перплексии
+        if "pppl" in pppl_df.columns:
+            pppl = pppl_df["pppl"].to_numpy()
+        elif "ppl" in pppl_df.columns:
+            pppl = pppl_df["ppl"].to_numpy()
+        elif pppl_df.shape[1] == 1:
+            # единственная колонка — считаем, что это он
+            pppl = pppl_df.iloc[:, 0].to_numpy()
+        else:
+            raise KeyError(
+                "ensure_pppl() output must have a 'pppl' (or 'ppl') column "
+                f"— got columns: {list(pppl_df.columns)}"
+            )
+
+        if len(pppl) != len(df):
+            raise ValueError(
+                f"Length mismatch between pppl scores ({len(pppl)}) and df ({len(df)})"
+            )
 
         log_pppl = np.log1p(pppl)
         # меньше лог-перплексии → лучше качество
